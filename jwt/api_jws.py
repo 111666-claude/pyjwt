@@ -33,6 +33,23 @@ _BASE64URL_ALPHABET = (
 )
 
 
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``object_pairs_hook`` that rejects JSON objects with duplicate keys.
+
+    A JWT header containing two ``alg`` members is ambiguous: different
+    parsers keep different occurrences, so an attacker can present one
+    algorithm to a screening proxy and another to the verifier. RFC 8725
+    §3.1 requires rejection of such tokens. The same applies to payload
+    claims (e.g. two ``exp`` members with conflicting values).
+    """
+    decoded: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError(f"Duplicate key in JSON object: {key!r}")
+        decoded[key] = value
+    return decoded
+
+
 class PyJWS:
     header_typ = "JWT"
 
@@ -369,7 +386,9 @@ class PyJWS:
         header_data = self._decode_base64url_segment(header_segment, "header")
 
         try:
-            header: dict[str, Any] = json.loads(header_data)
+            header: dict[str, Any] = json.loads(
+                header_data, object_pairs_hook=_reject_duplicate_json_keys
+            )
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid header string: {e}") from e
 
@@ -411,6 +430,12 @@ class PyJWS:
             alg = header["alg"]
         except KeyError:
             raise InvalidAlgorithmError("Algorithm not specified") from None
+
+        # The "alg" header parameter is defined as a case-sensitive ASCII
+        # string. A non-string value must never reach the algorithm lookup,
+        # where it could bypass the caller's allow-list by accident.
+        if not isinstance(alg, str):
+            raise InvalidAlgorithmError("Algorithm must be a string")
 
         if not alg or (algorithms is not None and alg not in algorithms):
             raise InvalidAlgorithmError("The specified alg value is not allowed")

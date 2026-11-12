@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import warnings
 from calendar import timegm
@@ -8,7 +9,12 @@ from collections.abc import Container, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Union, cast
 
-from .api_jws import PyJWS, _ALGORITHM_UNSET, _jws_global_obj
+from .api_jws import (
+    PyJWS,
+    _ALGORITHM_UNSET,
+    _jws_global_obj,
+    _reject_duplicate_json_keys,
+)
 from .exceptions import (
     DecodeError,
     ExpiredSignatureError,
@@ -19,6 +25,7 @@ from .exceptions import (
     InvalidJTIError,
     InvalidSubjectError,
     MissingRequiredClaimError,
+    PyJWTError,
 )
 from .warnings import RemovedInPyjwt3Warning
 
@@ -295,7 +302,10 @@ class PyJWT:
         payloads.
         """
         try:
-            payload: dict[str, Any] = json.loads(decoded["payload"])
+            payload: dict[str, Any] = json.loads(
+                decoded["payload"],
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
         except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid payload string: {e}") from e
         if not isinstance(payload, dict):
@@ -393,12 +403,22 @@ class PyJWT:
         if isinstance(leeway, timedelta):
             leeway = leeway.total_seconds()
 
+        # Leeway is a grace period applied in the caller's favor. A negative
+        # value would silently *shorten* the validity window and invert the
+        # intended semantics of exp/nbf/iat checks. NaN is even worse: every
+        # ordering comparison against it is False, so it would silently
+        # disable all time-claim verification.
+        if not math.isfinite(leeway) or leeway < 0:
+            raise ValueError("Leeway must be a finite, non-negative number")
+
         if audience is not None and not isinstance(audience, (str, Iterable)):
             raise TypeError("audience must be a string, iterable or None")
 
         self._validate_required_claims(payload, options["require"])
 
-        now = datetime.now(tz=timezone.utc).timestamp()
+        # One clock reading for every time claim in this call, so exp, nbf
+        # and iat are always evaluated against the same instant.
+        now = self._now()
 
         if "iat" in payload and options["verify_iat"]:
             self._validate_iat(payload, now, leeway)
@@ -467,18 +487,49 @@ class PyJWT:
         if not isinstance(payload.get("jti"), str):
             raise InvalidJTIError("JWT ID must be a string")
 
+    @staticmethod
+    def _now() -> float:
+        """Current time as a POSIX timestamp.
+
+        Centralizing the clock read keeps exp, nbf and iat on one consistent
+        time source per decode, and gives subclasses/tests a single seam to
+        pin the clock without monkey-patching :func:`datetime.now`.
+        """
+        return datetime.now(tz=timezone.utc).timestamp()
+
+    @staticmethod
+    def _coerce_timestamp(
+        payload: dict[str, Any], claim: str, error_type: type[PyJWTError]
+    ) -> float:
+        """Convert an exp/nbf/iat claim to a numeric timestamp.
+
+        Numeric values (including numeric strings, which earlier releases
+        accepted) are converted with ``float`` so fractional seconds and
+        arbitrarily large integer claims are handled without truncation or
+        silent overflow. Booleans are rejected explicitly even though
+        ``bool`` is an ``int`` subclass, and non-numeric values raise the
+        claim-specific error type.
+        """
+        value = payload[claim]
+        if isinstance(value, bool):
+            raise error_type(f"{claim} claim must be a numeric value.")
+        try:
+            timestamp = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise error_type(f"{claim} claim must be a numeric value.") from None
+        # JSON parsers may accept NaN/Infinity even though they are outside
+        # the JSON grammar; comparison against such a value is meaningless.
+        if not math.isfinite(timestamp):
+            raise error_type(f"{claim} claim must be a finite numeric value.")
+        return timestamp
+
     def _validate_iat(
         self,
         payload: dict[str, Any],
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            iat = int(payload["iat"])
-        except (ValueError, TypeError, OverflowError):
-            raise InvalidIssuedAtError(
-                "Issued At claim (iat) must be an integer."
-            ) from None
+        iat = self._coerce_timestamp(payload, "iat", InvalidIssuedAtError)
         if iat > (now + leeway):
             raise ImmatureSignatureError("The token is not yet valid (iat)")
 
@@ -488,11 +539,7 @@ class PyJWT:
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            nbf = int(payload["nbf"])
-        except (ValueError, TypeError, OverflowError):
-            raise DecodeError("Not Before claim (nbf) must be an integer.") from None
-
+        nbf = self._coerce_timestamp(payload, "nbf", DecodeError)
         if nbf > (now + leeway):
             raise ImmatureSignatureError("The token is not yet valid (nbf)")
 
@@ -502,13 +549,7 @@ class PyJWT:
         now: float,
         leeway: float,
     ) -> None:
-        try:
-            exp = int(payload["exp"])
-        except (ValueError, TypeError, OverflowError):
-            raise DecodeError(
-                "Expiration Time claim (exp) must be an integer."
-            ) from None
-
+        exp = self._coerce_timestamp(payload, "exp", DecodeError)
         if exp <= (now - leeway):
             raise ExpiredSignatureError("Signature has expired")
 
